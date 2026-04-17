@@ -63,7 +63,7 @@ app.post('/render', async (req, res) => {
       const out = path.join(dir, `clip${i}.mp4`);
       const start = videoClips[i].start || 0;
       const durArg = videoClips[i].duration ? `-t ${videoClips[i].duration}` : '';
-      await runFFmpeg(`ffmpeg -y -ss ${start} -i "${raw}" ${durArg} -vf "scale=${resolution},fps=${fps}" -c:v libx264 -preset ultrafast -crf 23 -threads 2 -c:a aac "${out}"`);
+      await runFFmpeg(`ffmpeg -y -ss ${start} -i "${raw}" ${durArg} -c copy "${out}"`);
       trimmedPaths.push(out);
       jobs[jobId].progress = 10 + Math.floor((i / videoClips.length) * 40);
     }
