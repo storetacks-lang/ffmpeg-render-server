@@ -148,49 +148,61 @@ app.post('/render', async (req, res) => {
       const segOut = path.join(dir, `seg${i}.mp4`);
 
       if (imageOverlays.length === 0 && audioOverlays.length === 0) {
+        // No overlays — just copy
         fs.copyFileSync(trimmed, segOut);
 
-      } else if (imageOverlays.length > 0 && audioOverlays.length === 0) {
-        // Download all PNG overlays first
-        const imgPaths = [];
+      } else if (imageOverlays.length > 0) {
+        // Download all PNGs
+        const imgs = [];
         for (let j = 0; j < imageOverlays.length; j++) {
           const img = imageOverlays[j];
           const s = img.settings || img;
           const imgPath = path.join(dir, `clip${i}_img${j}.png`);
           await download(img.src || s.src, imgPath);
-          imgPaths.push({ path: imgPath, img, s });
-        }
-
-        // Build filter complex with correct scale then overlay syntax
-        let inputs = `-i "${trimmed}"`;
-        imgPaths.forEach(({ path: p }) => { inputs += ` -i "${p}"`; });
-
-        let filterParts = [];
-        let lastLabel = '[0:v]';
-
-        for (let j = 0; j < imgPaths.length; j++) {
-          const { img, s } = imgPaths[j];
           const x = Math.round((s.x != null ? s.x : (img.x || 0)) * scaleX);
           const y = Math.round((s.y != null ? s.y : (img.y || 0)) * scaleY);
           const w = Math.round((s.width != null ? s.width : (img.width || 100)) * scaleX);
           const h = Math.round((s.height != null ? s.height : (img.height || 100)) * scaleY);
           const tStart = img.start != null ? img.start : 0;
           const tEnd = tStart + (img.duration != null ? img.duration : (clip.duration || 5));
-          const enable = `between(t,${tStart},${tEnd})`;
-          const scaledLabel = `[scaled${j}]`;
-          const outLabel = j === imgPaths.length - 1 ? '[vout]' : `[ov${j}]`;
-          const nextIn = j === imgPaths.length - 1 ? lastLabel : lastLabel;
+          imgs.push({ path: imgPath, x, y, w, h, tStart, tEnd });
+        }
 
+        // Build correct filter_complex:
+        // [1:v]scale=W:H[s0]; [0:v][s0]overlay=x=X:y=Y:enable='...'[o0];
+        // [2:v]scale=W2:H2[s1]; [o0][s1]overlay=x=X2:y=Y2:enable='...'[o1]; ...
+        let inputArgs = `-i "${trimmed}"`;
+        imgs.forEach(img => { inputArgs += ` -i "${img.path}"`; });
+
+        const filterParts = [];
+        let prevLabel = '[0:v]';
+
+        for (let j = 0; j < imgs.length; j++) {
+          const { x, y, w, h, tStart, tEnd } = imgs[j];
+          const scaledLabel = `[s${j}]`;
+          const outLabel = j === imgs.length - 1 ? '[vout]' : `[o${j}]`;
+          const enable = `between(t,${tStart},${tEnd})`;
+
+          // Scale the PNG input — input index is j+1 (0 is the video)
           filterParts.push(`[${j+1}:v]scale=${w}:${h}${scaledLabel}`);
-          filterParts.push(`${lastLabel}${scaledLabel}overlay=x=${x}:y=${y}:enable='${enable}'${outLabel}`);
-          lastLabel = outLabel;
+          // Overlay scaled PNG onto previous video output
+          filterParts.push(`${prevLabel}${scaledLabel}overlay=x=${x}:y=${y}:enable='${enable}'${outLabel}`);
+          prevLabel = outLabel;
         }
 
         const filterComplex = filterParts.join(';');
-        await runFFmpeg(`ffmpeg -y ${inputs} -filter_complex "${filterComplex}" -map "[vout]" -map 0:a -c:v libx264 -preset ultrafast -crf 23 -c:a copy "${segOut}"`);
 
-      } else {
-        // Audio overlays
+        // Check if video has audio stream
+        const hasAudio = !clip.audioMuted;
+        const audioMap = hasAudio ? `-map 0:a` : '';
+        const audioCodec = hasAudio ? `-c:a copy` : '';
+
+        await runFFmpeg(
+          `ffmpeg -y ${inputArgs} -filter_complex "${filterComplex}" -map "[vout]" ${audioMap} -c:v libx264 -preset ultrafast -crf 23 ${audioCodec} "${segOut}"`
+        );
+
+      } else if (audioOverlays.length > 0) {
+        // Audio overlays only
         const audioFiles = [];
         for (let j = 0; j < audioOverlays.length; j++) {
           const ao = audioOverlays[j];
