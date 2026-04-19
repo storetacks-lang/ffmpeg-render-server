@@ -48,25 +48,15 @@ function escapeText(text) {
     .replace(/,/g, '\\,');
 }
 
-function parsePercent(val, dimension) {
-  if (typeof val === 'string' && val.endsWith('%')) {
-    return `${dimension}*${parseFloat(val) / 100}`;
-  }
-  return val || `(${dimension}-text_w)/2`;
-}
-
-// Check if file is HEVC and transcode to H264 if needed
 async function ensureH264(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
     exec(`ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "${inputPath}"`, (err, stdout) => {
       if (err) return reject(err);
       const codec = stdout.trim().toLowerCase();
       if (codec === 'hevc' || codec === 'h265') {
-        // Transcode HEVC to H264
         runFFmpeg(`ffmpeg -y -i "${inputPath}" -c:v libx264 -preset ultrafast -crf 23 -c:a copy "${outputPath}"`)
           .then(resolve).catch(reject);
       } else {
-        // Already H264 or compatible — just copy
         fs.copyFileSync(inputPath, outputPath);
         resolve();
       }
@@ -104,7 +94,39 @@ app.post('/render', async (req, res) => {
   jobs[jobId] = { status: 'running', progress: 0, url: null, message: 'Starting...' };
   res.json({ jobId });
 
-  const { output, videoClips } = req.body;
+  // Support both payload formats:
+  // Format A (new): { output, videoClips }
+  // Format B (movie): { movie: { scenes, resolution, fps } }
+  let videoClips = req.body.videoClips;
+  let output = req.body.output;
+
+  if (!videoClips && req.body.movie) {
+    const movie = req.body.movie;
+    output = {
+      resolution: movie.resolution || '1080p',
+      fps: movie.fps || 30,
+      quality: movie.quality || 'max'
+    };
+    videoClips = [];
+    for (const scene of (movie.scenes || [])) {
+      const videoEl = scene.elements?.find(e => e.type === 'video');
+      const textEls = scene.elements?.filter(e => e.type === 'text') || [];
+      const audioEls = scene.elements?.filter(e => e.type === 'audio') || [];
+      if (videoEl) {
+        videoClips.push({
+          src: videoEl.src,
+          start: videoEl.start || 0,
+          duration: videoEl.duration || scene.duration,
+          audioMuted: videoEl.audioMuted || false,
+          overlays: [
+            ...textEls.map(t => ({ type: 'text', ...t, settings: t.settings || t })),
+            ...audioEls.map(a => ({ type: 'audio', ...a }))
+          ]
+        });
+      }
+    }
+  }
+
   const dir = path.join(TMP, jobId);
   fs.mkdirSync(dir);
 
@@ -114,6 +136,12 @@ app.post('/render', async (req, res) => {
     const [outW, outH] = resolution.split('x').map(Number);
     const FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
 
+    // Preview canvas dimensions (what Lovable uses)
+    const PREVIEW_W = 540;
+    const PREVIEW_H = 960;
+    const scaleX = outW / PREVIEW_W;
+    const scaleY = outH / PREVIEW_H;
+
     jobs[jobId].message = 'Downloading clips...';
     jobs[jobId].progress = 10;
 
@@ -122,22 +150,18 @@ app.post('/render', async (req, res) => {
     for (let i = 0; i < (videoClips || []).length; i++) {
       const clip = videoClips[i];
 
-      // Download raw file
       const raw = path.join(dir, `clip${i}_raw`);
       await download(clip.src, raw);
 
-      // Convert HEVC to H264 if needed
       const converted = path.join(dir, `clip${i}_h264.mp4`);
       await ensureH264(raw, converted);
 
-      // Trim
       const start = clip.start || 0;
       const durArg = clip.duration ? `-t ${clip.duration}` : '';
       const audioArg = clip.audioMuted ? '-an' : '-c:a copy';
       const trimmed = path.join(dir, `clip${i}_trim.mp4`);
       await runFFmpeg(`ffmpeg -y -ss ${start} -i "${converted}" ${durArg} -c:v copy ${audioArg} "${trimmed}"`);
 
-      // Process overlays
       const overlays = clip.overlays || [];
       const textOverlays = overlays.filter(o => o.type === 'text');
       const audioOverlays = overlays.filter(o => o.type === 'audio');
@@ -145,51 +169,49 @@ app.post('/render', async (req, res) => {
 
       if (textOverlays.length === 0 && audioOverlays.length === 0) {
         fs.copyFileSync(trimmed, segOut);
-      } else if (textOverlays.length > 0 && audioOverlays.length === 0) {
-        // Text only — vf drawtext
-        const drawtextFilters = textOverlays.map(t => {
-          const text = escapeText(t.text);
-          const fontSize = Math.round((t.settings?.['font-size'] || 22) * (outH / 100));
-          const color = (t.settings?.color || '#ffffff').replace('#', '0x') + 'FF';
-          const xExpr = parsePercent(t.settings?.x, 'w') + '-text_w/2';
-          const yExpr = parsePercent(t.settings?.y, 'h') + '-text_h/2';
-          const enable = t.start != null && t.duration != null
-            ? `between(t,${t.start},${t.start + t.duration})` : '1';
-          return `drawtext=fontfile='${FONT}':text='${text}':fontsize=${fontSize}:fontcolor=${color}:x=${xExpr}:y=${yExpr}:enable='${enable}':box=1:boxcolor=black@0.35:boxborderw=6`;
-        }).join(',');
-        await runFFmpeg(`ffmpeg -y -i "${trimmed}" -vf "${drawtextFilters}" -c:v libx264 -preset ultrafast -crf 23 -c:a copy "${segOut}"`);
-
       } else {
-        // Audio overlays (with optional text)
-        const audioFiles = [];
-        for (let j = 0; j < audioOverlays.length; j++) {
-          const ao = audioOverlays[j];
-          const ap = path.join(dir, `clip${i}_aud${j}.mp3`);
-          await download(ao.src, ap);
-          audioFiles.push(ap);
-        }
+        // Build drawtext filters using exact preview pixel coords scaled to render resolution
+        const buildDrawtext = (textOverlays) => textOverlays.map(t => {
+          const s = t.settings || t;
+          const text = escapeText(s.text || t.text || '');
+          const fontSize = Math.round((s['font-size'] || s.fontSize || t.fontSize || 22) * scaleY);
+          const rawColor = s.color || t.color || '#ffffff';
+          const color = rawColor.replace('#', '0x') + 'FF';
+          const x = Math.round((s.x != null ? s.x : (t.x || 0)) * scaleX);
+          const y = Math.round((s.y != null ? s.y : (t.y || 0)) * scaleY);
+          const tStart = t.start != null ? t.start : 0;
+          const tDur = t.duration != null ? t.duration : clip.duration;
+          const enable = `between(t,${tStart},${tStart + tDur})`;
+          return `drawtext=fontfile='${FONT}':text='${text}':fontsize=${fontSize}:fontcolor=${color}:x=${x}:y=${y}:enable='${enable}':box=1:boxcolor=black@0.35:boxborderw=6`;
+        }).join(',');
 
-        let inputs = `-i "${trimmed}"`;
-        audioFiles.forEach(ap => { inputs += ` -i "${ap}"`; });
-
-        const amixInputs = '[0:a]' + audioFiles.map((_, j) => `[${j+1}:a]`).join('');
-        const filterParts = [`${amixInputs}amix=inputs=${1 + audioFiles.length}:duration=first[aout]`];
-
-        if (textOverlays.length > 0) {
-          const drawtextFilters = textOverlays.map(t => {
-            const text = escapeText(t.text);
-            const fontSize = Math.round((t.settings?.['font-size'] || 22) * (outH / 100));
-            const color = (t.settings?.color || '#ffffff').replace('#', '0x') + 'FF';
-            const xExpr = parsePercent(t.settings?.x, 'w') + '-text_w/2';
-            const yExpr = parsePercent(t.settings?.y, 'h') + '-text_h/2';
-            const enable = t.start != null && t.duration != null
-              ? `between(t,${t.start},${t.start + t.duration})` : '1';
-            return `drawtext=fontfile='${FONT}':text='${text}':fontsize=${fontSize}:fontcolor=${color}:x=${xExpr}:y=${yExpr}:enable='${enable}':box=1:boxcolor=black@0.35:boxborderw=6`;
-          }).join(',');
-          filterParts.push(`[0:v]${drawtextFilters}[vout]`);
-          await runFFmpeg(`ffmpeg -y ${inputs} -filter_complex "${filterParts.join(';')}" -map "[vout]" -map "[aout]" -c:v libx264 -preset ultrafast -crf 23 "${segOut}"`);
+        if (audioOverlays.length === 0) {
+          // Text only
+          const vf = buildDrawtext(textOverlays);
+          await runFFmpeg(`ffmpeg -y -i "${trimmed}" -vf "${vf}" -c:v libx264 -preset ultrafast -crf 23 -c:a copy "${segOut}"`);
         } else {
-          await runFFmpeg(`ffmpeg -y ${inputs} -filter_complex "${filterParts.join(';')}" -map 0:v -map "[aout]" -c:v copy "${segOut}"`);
+          // Audio overlays + optional text
+          const audioFiles = [];
+          for (let j = 0; j < audioOverlays.length; j++) {
+            const ao = audioOverlays[j];
+            const ap = path.join(dir, `clip${i}_aud${j}.mp3`);
+            await download(ao.src, ap);
+            audioFiles.push(ap);
+          }
+
+          let inputs = `-i "${trimmed}"`;
+          audioFiles.forEach(ap => { inputs += ` -i "${ap}"`; });
+
+          const amixInputs = '[0:a]' + audioFiles.map((_, j) => `[${j+1}:a]`).join('');
+          const filterParts = [`${amixInputs}amix=inputs=${1 + audioFiles.length}:duration=first[aout]`];
+
+          if (textOverlays.length > 0) {
+            const vf = buildDrawtext(textOverlays);
+            filterParts.push(`[0:v]${vf}[vout]`);
+            await runFFmpeg(`ffmpeg -y ${inputs} -filter_complex "${filterParts.join(';')}" -map "[vout]" -map "[aout]" -c:v libx264 -preset ultrafast -crf 23 "${segOut}"`);
+          } else {
+            await runFFmpeg(`ffmpeg -y ${inputs} -filter_complex "${filterParts.join(';')}" -map 0:v -map "[aout]" -c:v copy "${segOut}"`);
+          }
         }
       }
 
@@ -197,7 +219,6 @@ app.post('/render', async (req, res) => {
       jobs[jobId].progress = 10 + Math.floor(((i + 1) / videoClips.length) * 65);
     }
 
-    // Concat
     jobs[jobId].message = 'Merging...';
     jobs[jobId].progress = 80;
     const listFile = path.join(dir, 'list.txt');
