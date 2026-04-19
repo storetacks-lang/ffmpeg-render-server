@@ -84,7 +84,6 @@ app.post('/render', async (req, res) => {
   jobs[jobId] = { status: 'running', progress: 0, url: null, message: 'Starting...' };
   res.json({ jobId });
 
-  // Support both payload formats
   let videoClips = req.body.videoClips;
   let output = req.body.output;
 
@@ -131,13 +130,12 @@ app.post('/render', async (req, res) => {
     for (let i = 0; i < (videoClips || []).length; i++) {
       const clip = videoClips[i];
 
-      // Download + convert
       const raw = path.join(dir, `clip${i}_raw`);
       await download(clip.src, raw);
+
       const converted = path.join(dir, `clip${i}_h264.mp4`);
       await ensureH264(raw, converted);
 
-      // Trim
       const start = clip.start || 0;
       const durArg = clip.duration ? `-t ${clip.duration}` : '';
       const audioArg = clip.audioMuted ? '-an' : '-c:a copy';
@@ -151,19 +149,27 @@ app.post('/render', async (req, res) => {
 
       if (imageOverlays.length === 0 && audioOverlays.length === 0) {
         fs.copyFileSync(trimmed, segOut);
-      } else if (imageOverlays.length > 0 && audioOverlays.length === 0) {
-        // Overlay PNG images at exact pixel positions with timing
-        let filterComplex = '';
-        let inputs = `-i "${trimmed}"`;
-        let lastLabel = '[0:v]';
 
+      } else if (imageOverlays.length > 0 && audioOverlays.length === 0) {
+        // Download all PNG overlays first
+        const imgPaths = [];
         for (let j = 0; j < imageOverlays.length; j++) {
           const img = imageOverlays[j];
           const s = img.settings || img;
           const imgPath = path.join(dir, `clip${i}_img${j}.png`);
           await download(img.src || s.src, imgPath);
+          imgPaths.push({ path: imgPath, img, s });
+        }
 
-          // Scale image to render resolution coordinates
+        // Build filter complex with correct scale then overlay syntax
+        let inputs = `-i "${trimmed}"`;
+        imgPaths.forEach(({ path: p }) => { inputs += ` -i "${p}"`; });
+
+        let filterParts = [];
+        let lastLabel = '[0:v]';
+
+        for (let j = 0; j < imgPaths.length; j++) {
+          const { img, s } = imgPaths[j];
           const x = Math.round((s.x != null ? s.x : (img.x || 0)) * scaleX);
           const y = Math.round((s.y != null ? s.y : (img.y || 0)) * scaleY);
           const w = Math.round((s.width != null ? s.width : (img.width || 100)) * scaleX);
@@ -171,20 +177,20 @@ app.post('/render', async (req, res) => {
           const tStart = img.start != null ? img.start : 0;
           const tEnd = tStart + (img.duration != null ? img.duration : (clip.duration || 5));
           const enable = `between(t,${tStart},${tEnd})`;
+          const scaledLabel = `[scaled${j}]`;
+          const outLabel = j === imgPaths.length - 1 ? '[vout]' : `[ov${j}]`;
+          const nextIn = j === imgPaths.length - 1 ? lastLabel : lastLabel;
 
-          inputs += ` -i "${imgPath}"`;
-          const inLabel = j === 0 ? '[0:v]' : `[v${j-1}]`;
-          const outLabel = j === imageOverlays.length - 1 ? '[vout]' : `[v${j}]`;
-          filterComplex += `${inLabel}[${j+1}:v]scale=${w}:${h},overlay=x=${x}:y=${y}:enable='${enable}'${outLabel};`;
+          filterParts.push(`[${j+1}:v]scale=${w}:${h}${scaledLabel}`);
+          filterParts.push(`${lastLabel}${scaledLabel}overlay=x=${x}:y=${y}:enable='${enable}'${outLabel}`);
+          lastLabel = outLabel;
         }
 
-        // Remove trailing semicolon
-        filterComplex = filterComplex.replace(/;$/, '');
-
+        const filterComplex = filterParts.join(';');
         await runFFmpeg(`ffmpeg -y ${inputs} -filter_complex "${filterComplex}" -map "[vout]" -map 0:a -c:v libx264 -preset ultrafast -crf 23 -c:a copy "${segOut}"`);
 
-      } else if (audioOverlays.length > 0) {
-        // Audio mix (with optional image overlays)
+      } else {
+        // Audio overlays
         const audioFiles = [];
         for (let j = 0; j < audioOverlays.length; j++) {
           const ao = audioOverlays[j];
@@ -197,7 +203,6 @@ app.post('/render', async (req, res) => {
         audioFiles.forEach(ap => { inputs += ` -i "${ap}"`; });
         const amixInputs = '[0:a]' + audioFiles.map((_, j) => `[${j+1}:a]`).join('');
         const filterComplex = `${amixInputs}amix=inputs=${1 + audioFiles.length}:duration=first[aout]`;
-
         await runFFmpeg(`ffmpeg -y ${inputs} -filter_complex "${filterComplex}" -map 0:v -map "[aout]" -c:v copy "${segOut}"`);
       }
 
@@ -205,7 +210,6 @@ app.post('/render', async (req, res) => {
       jobs[jobId].progress = 10 + Math.floor(((i + 1) / videoClips.length) * 65);
     }
 
-    // Concat
     jobs[jobId].message = 'Merging...';
     jobs[jobId].progress = 80;
     const listFile = path.join(dir, 'list.txt');
