@@ -38,16 +38,6 @@ function runFFmpeg(cmd) {
   });
 }
 
-function escapeText(text) {
-  return (text || '')
-    .replace(/\\/g, '\\\\')
-    .replace(/'/g, '\u2019')
-    .replace(/:/g, '\\:')
-    .replace(/\[/g, '\\[')
-    .replace(/\]/g, '\\]')
-    .replace(/,/g, '\\,');
-}
-
 async function ensureH264(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
     exec(`ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "${inputPath}"`, (err, stdout) => {
@@ -94,9 +84,7 @@ app.post('/render', async (req, res) => {
   jobs[jobId] = { status: 'running', progress: 0, url: null, message: 'Starting...' };
   res.json({ jobId });
 
-  // Support both payload formats:
-  // Format A (new): { output, videoClips }
-  // Format B (movie): { movie: { scenes, resolution, fps } }
+  // Support both payload formats
   let videoClips = req.body.videoClips;
   let output = req.body.output;
 
@@ -110,18 +98,14 @@ app.post('/render', async (req, res) => {
     videoClips = [];
     for (const scene of (movie.scenes || [])) {
       const videoEl = scene.elements?.find(e => e.type === 'video');
-      const textEls = scene.elements?.filter(e => e.type === 'text') || [];
-      const audioEls = scene.elements?.filter(e => e.type === 'audio') || [];
+      const overlayEls = scene.elements?.filter(e => e.type !== 'video') || [];
       if (videoEl) {
         videoClips.push({
           src: videoEl.src,
           start: videoEl.start || 0,
           duration: videoEl.duration || scene.duration,
           audioMuted: videoEl.audioMuted || false,
-          overlays: [
-            ...textEls.map(t => ({ type: 'text', ...t, settings: t.settings || t })),
-            ...audioEls.map(a => ({ type: 'audio', ...a }))
-          ]
+          overlays: overlayEls.map(el => ({ ...el, settings: el.settings || el }))
         });
       }
     }
@@ -134,9 +118,6 @@ app.post('/render', async (req, res) => {
     const fps = output?.fps || 30;
     const resolution = output?.resolution === '1080p' ? '1920x1080' : '1280x720';
     const [outW, outH] = resolution.split('x').map(Number);
-    const FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
-
-    // Preview canvas dimensions (what Lovable uses)
     const PREVIEW_W = 540;
     const PREVIEW_H = 960;
     const scaleX = outW / PREVIEW_W;
@@ -150,12 +131,13 @@ app.post('/render', async (req, res) => {
     for (let i = 0; i < (videoClips || []).length; i++) {
       const clip = videoClips[i];
 
+      // Download + convert
       const raw = path.join(dir, `clip${i}_raw`);
       await download(clip.src, raw);
-
       const converted = path.join(dir, `clip${i}_h264.mp4`);
       await ensureH264(raw, converted);
 
+      // Trim
       const start = clip.start || 0;
       const durArg = clip.duration ? `-t ${clip.duration}` : '';
       const audioArg = clip.audioMuted ? '-an' : '-c:a copy';
@@ -163,62 +145,67 @@ app.post('/render', async (req, res) => {
       await runFFmpeg(`ffmpeg -y -ss ${start} -i "${converted}" ${durArg} -c:v copy ${audioArg} "${trimmed}"`);
 
       const overlays = clip.overlays || [];
-      const textOverlays = overlays.filter(o => o.type === 'text');
+      const imageOverlays = overlays.filter(o => o.type === 'image');
       const audioOverlays = overlays.filter(o => o.type === 'audio');
       const segOut = path.join(dir, `seg${i}.mp4`);
 
-      if (textOverlays.length === 0 && audioOverlays.length === 0) {
+      if (imageOverlays.length === 0 && audioOverlays.length === 0) {
         fs.copyFileSync(trimmed, segOut);
-      } else {
-        // Build drawtext filters using exact preview pixel coords scaled to render resolution
-        const buildDrawtext = (textOverlays) => textOverlays.map(t => {
-          const s = t.settings || t;
-          const text = escapeText(s.text || t.text || '');
-          const fontSize = Math.round((s['font-size'] || s.fontSize || t.fontSize || 22) * scaleY);
-          const rawColor = s.color || t.color || '#ffffff';
-          const color = rawColor.replace('#', '0x') + 'FF';
-          const x = Math.round((s.x != null ? s.x : (t.x || 0)) * scaleX);
-          const y = Math.round((s.y != null ? s.y : (t.y || 0)) * scaleY);
-          const tStart = t.start != null ? t.start : 0;
-          const tDur = t.duration != null ? t.duration : clip.duration;
-          const enable = `between(t,${tStart},${tStart + tDur})`;
-          return `drawtext=fontfile='${FONT}':text='${text}':fontsize=${fontSize}:fontcolor=${color}:x=${x}:y=${y}:enable='${enable}':box=1:boxcolor=black@0.35:boxborderw=6`;
-        }).join(',');
+      } else if (imageOverlays.length > 0 && audioOverlays.length === 0) {
+        // Overlay PNG images at exact pixel positions with timing
+        let filterComplex = '';
+        let inputs = `-i "${trimmed}"`;
+        let lastLabel = '[0:v]';
 
-        if (audioOverlays.length === 0) {
-          // Text only
-          const vf = buildDrawtext(textOverlays);
-          await runFFmpeg(`ffmpeg -y -i "${trimmed}" -vf "${vf}" -c:v libx264 -preset ultrafast -crf 23 -c:a copy "${segOut}"`);
-        } else {
-          // Audio overlays + optional text
-          const audioFiles = [];
-          for (let j = 0; j < audioOverlays.length; j++) {
-            const ao = audioOverlays[j];
-            const ap = path.join(dir, `clip${i}_aud${j}.mp3`);
-            await download(ao.src, ap);
-            audioFiles.push(ap);
-          }
+        for (let j = 0; j < imageOverlays.length; j++) {
+          const img = imageOverlays[j];
+          const s = img.settings || img;
+          const imgPath = path.join(dir, `clip${i}_img${j}.png`);
+          await download(img.src || s.src, imgPath);
 
-          let inputs = `-i "${trimmed}"`;
-          audioFiles.forEach(ap => { inputs += ` -i "${ap}"`; });
+          // Scale image to render resolution coordinates
+          const x = Math.round((s.x != null ? s.x : (img.x || 0)) * scaleX);
+          const y = Math.round((s.y != null ? s.y : (img.y || 0)) * scaleY);
+          const w = Math.round((s.width != null ? s.width : (img.width || 100)) * scaleX);
+          const h = Math.round((s.height != null ? s.height : (img.height || 100)) * scaleY);
+          const tStart = img.start != null ? img.start : 0;
+          const tEnd = tStart + (img.duration != null ? img.duration : (clip.duration || 5));
+          const enable = `between(t,${tStart},${tEnd})`;
 
-          const amixInputs = '[0:a]' + audioFiles.map((_, j) => `[${j+1}:a]`).join('');
-          const filterParts = [`${amixInputs}amix=inputs=${1 + audioFiles.length}:duration=first[aout]`];
-
-          if (textOverlays.length > 0) {
-            const vf = buildDrawtext(textOverlays);
-            filterParts.push(`[0:v]${vf}[vout]`);
-            await runFFmpeg(`ffmpeg -y ${inputs} -filter_complex "${filterParts.join(';')}" -map "[vout]" -map "[aout]" -c:v libx264 -preset ultrafast -crf 23 "${segOut}"`);
-          } else {
-            await runFFmpeg(`ffmpeg -y ${inputs} -filter_complex "${filterParts.join(';')}" -map 0:v -map "[aout]" -c:v copy "${segOut}"`);
-          }
+          inputs += ` -i "${imgPath}"`;
+          const inLabel = j === 0 ? '[0:v]' : `[v${j-1}]`;
+          const outLabel = j === imageOverlays.length - 1 ? '[vout]' : `[v${j}]`;
+          filterComplex += `${inLabel}[${j+1}:v]scale=${w}:${h},overlay=x=${x}:y=${y}:enable='${enable}'${outLabel};`;
         }
+
+        // Remove trailing semicolon
+        filterComplex = filterComplex.replace(/;$/, '');
+
+        await runFFmpeg(`ffmpeg -y ${inputs} -filter_complex "${filterComplex}" -map "[vout]" -map 0:a -c:v libx264 -preset ultrafast -crf 23 -c:a copy "${segOut}"`);
+
+      } else if (audioOverlays.length > 0) {
+        // Audio mix (with optional image overlays)
+        const audioFiles = [];
+        for (let j = 0; j < audioOverlays.length; j++) {
+          const ao = audioOverlays[j];
+          const ap = path.join(dir, `clip${i}_aud${j}.mp3`);
+          await download(ao.src, ap);
+          audioFiles.push(ap);
+        }
+
+        let inputs = `-i "${trimmed}"`;
+        audioFiles.forEach(ap => { inputs += ` -i "${ap}"`; });
+        const amixInputs = '[0:a]' + audioFiles.map((_, j) => `[${j+1}:a]`).join('');
+        const filterComplex = `${amixInputs}amix=inputs=${1 + audioFiles.length}:duration=first[aout]`;
+
+        await runFFmpeg(`ffmpeg -y ${inputs} -filter_complex "${filterComplex}" -map 0:v -map "[aout]" -c:v copy "${segOut}"`);
       }
 
       segmentPaths.push(segOut);
       jobs[jobId].progress = 10 + Math.floor(((i + 1) / videoClips.length) * 65);
     }
 
+    // Concat
     jobs[jobId].message = 'Merging...';
     jobs[jobId].progress = 80;
     const listFile = path.join(dir, 'list.txt');
